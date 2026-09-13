@@ -239,6 +239,7 @@ def test_the_instructions_carry_the_untrusted_content_warning(mcp):
 # `{"type": "integer"}`, and it says the same thing about what may be sent.
 ADVERTISED = {
     "read_room": ({"room": "string", "since": "integer?", "limit": "integer?"}, ["room"]),
+    "export_room": ({"room": "string"}, ["room"]),
     "wait_for_message": (
         {"room": "string", "since": "integer", "seconds": "number"},
         ["room", "since"],
@@ -291,6 +292,7 @@ ADVERTISED = {
 # to a configured external instance.
 ANNOTATED = {
     "read_room": {"readOnlyHint": True, "openWorldHint": True},
+    "export_room": {"readOnlyHint": True, "openWorldHint": True},
     "wait_for_message": {"readOnlyHint": True, "openWorldHint": True},
     "list_rooms": {"readOnlyHint": True, "openWorldHint": True},
     "discover_rooms": {"readOnlyHint": True, "openWorldHint": True},
@@ -370,7 +372,7 @@ def test_the_descriptions_the_model_reads_survive_the_generation(mcp):
     description is shared by the four tools that take a room."""
     tools = mcp.tools()
     schemas = {tool.name: tool.input_schema for tool in tools}
-    for name in ("read_room", "wait_for_message", "say"):
+    for name in ("read_room", "export_room", "wait_for_message", "say"):
         assert schemas[name]["properties"]["room"]["description"] == "Room name."
     assert "4096" in schemas["say"]["properties"]["text"]["description"]
     assert "TECHNOCORE_NICK" in schemas["say"]["properties"]["nick"]["description"]
@@ -416,6 +418,26 @@ def test_since_is_forwarded_so_polling_returns_only_new_lines(mcp):
         mcp.call("say", {"room": "lobby", "text": f"m{i}", "nick": "bot"})
     body = text_of(mcp.call("read_room", {"room": "lobby", "since": 2}))
     assert "m2" in body and "m0" not in body
+
+
+def test_export_room_reaches_the_retained_ring_as_raw_jsonl(mcp, tmp_path):
+    """#738: the manual advertises /r/<room>/export; an MCP-only client now has the
+    same read-only lane, without reserialising records that signed verifiers consume byte
+    for byte.
+    """
+    import store
+
+    for i in range(205):
+        store.append(tmp_path, "archive", "bot", f"m{i:03d}")
+
+    page = text_of(mcp.call("read_room", {"room": "archive", "limit": 5000}))
+    exported = text_of(mcp.call("export_room", {"room": "archive"}))
+
+    assert page.count("<~bot>") == 200
+    assert "m000" not in page and "m204" in page
+    assert exported.count("\n") == 205
+    assert '"text":"m000"' in exported and '"text":"m204"' in exported
+    assert mcp.asked[-1] == f"{mcp.module.BASE_URL}/r/archive/export"
 
 
 def test_say_without_a_nick_falls_back_to_the_session_anon_name(mcp):
@@ -657,6 +679,7 @@ def test_reads_stay_on_the_get_lanes(mcp):
     mcp.call("say", {"room": "lobby", "text": "hi", "nick": "bot"})
     for name, arguments in (
         ("read_room", {"room": "lobby"}),
+        ("export_room", {"room": "lobby"}),
         ("wait_for_message", {"room": "lobby", "since": 0, "seconds": 0}),
         ("list_rooms", {}),
         ("discover_rooms", {}),
@@ -779,6 +802,7 @@ def test_the_advertised_pattern_is_the_one_that_is_enforced(mcp):
     schemas = {tool.name: tool.input_schema for tool in mcp.tools()}
     for tool, field in (
         ("read_room", "room"),
+        ("export_room", "room"),
         ("read_note", "namespace"),
         ("read_note", "key"),
     ):
