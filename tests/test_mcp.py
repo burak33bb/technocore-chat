@@ -137,7 +137,21 @@ def mcp(tmp_path, monkeypatch):
                 response = await service.request(method, url, content=body, headers=headers)
                 return response.status_code, response.text
 
+            async def export_fetch(url, headers, timeout, after, limit):
+                sent.append(("GET", url, None))
+                lines = []
+                async with service.stream("GET", url, headers=headers) as response:
+                    async for raw in response.aiter_lines():
+                        rec = json.loads(raw)
+                        if after is not None and rec["seq"] <= after:
+                            continue
+                        lines.append(raw + "\n")
+                        if len(lines) > limit:
+                            break
+                    return response.status_code, "".join(lines)
+
             monkeypatch.setattr(mcp_server, "_fetch", fetch)
+            monkeypatch.setattr(mcp_server, "_export_fetch", export_fetch)
             monkeypatch.setattr(mcp_server, "DEFAULT_NICK", "")
             client = stack.enter_context(
                 portal.wrap_async_context_manager(Client(mcp_server.server))
@@ -239,7 +253,7 @@ def test_the_instructions_carry_the_untrusted_content_warning(mcp):
 # `{"type": "integer"}`, and it says the same thing about what may be sent.
 ADVERTISED = {
     "read_room": ({"room": "string", "since": "integer?", "limit": "integer?"}, ["room"]),
-    "export_room": ({"room": "string"}, ["room"]),
+    "export_room": ({"room": "string", "after": "integer?", "limit": "integer?"}, ["room"]),
     "wait_for_message": (
         {"room": "string", "since": "integer", "seconds": "number"},
         ["room", "since"],
@@ -420,10 +434,10 @@ def test_since_is_forwarded_so_polling_returns_only_new_lines(mcp):
     assert "m2" in body and "m0" not in body
 
 
-def test_export_room_reaches_the_retained_ring_as_raw_jsonl(mcp, tmp_path):
+def test_export_room_pages_the_retained_ring_as_raw_jsonl(mcp, tmp_path):
     """#738: the manual advertises /r/<room>/export; an MCP-only client now has the
-    same read-only lane, without reserialising records that signed verifiers consume byte
-    for byte.
+    same read-only lane. The wrapper keeps each record byte-exact, but pages the tool
+    result because MCP has no streaming download shape.
     """
     import store
 
@@ -432,12 +446,105 @@ def test_export_room_reaches_the_retained_ring_as_raw_jsonl(mcp, tmp_path):
 
     page = text_of(mcp.call("read_room", {"room": "archive", "limit": 5000}))
     exported = text_of(mcp.call("export_room", {"room": "archive"}))
+    rest = text_of(mcp.call("export_room", {"room": "archive", "after": 200}))
 
     assert page.count("<~bot>") == 200
     assert "m000" not in page and "m204" in page
-    assert exported.count("\n") == 205
-    assert '"text":"m000"' in exported and '"text":"m204"' in exported
-    assert mcp.asked[-1] == f"{mcp.module.BASE_URL}/r/archive/export"
+    assert exported.count("\n") == mcp.module.EXPORT_LIMIT_DEFAULT + 1
+    assert '"text":"m000"' in exported and '"text":"m199"' in exported
+    assert '"text":"m200"' not in exported
+    assert "call export_room with after=200" in exported
+    assert rest.count("\n") == 5
+    assert '"text":"m200"' in rest and '"text":"m204"' in rest
+    assert mcp.asked[-2:] == [
+        f"{mcp.module.BASE_URL}/r/archive/export",
+        f"{mcp.module.BASE_URL}/r/archive/export",
+    ]
+
+
+def test_export_room_clamps_limit_and_stops_the_stream_after_one_extra_line(mcp, tmp_path):
+    """The MCP transport cannot carry a download stream, so the wrapper must not read the
+    whole exported ring just to return a bounded page.
+    """
+    import store
+
+    seen = []
+
+    for i in range(8):
+        store.append(tmp_path, "archive", "bot", f"m{i:03d}")
+
+    async def counted_export(url, headers, timeout, after, limit):
+        seen.append((after, limit))
+        lines = []
+        for raw in store.room_path(tmp_path, "archive").read_text().splitlines():
+            rec = json.loads(raw)
+            if after is not None and rec["seq"] <= after:
+                continue
+            lines.append(raw + "\n")
+            if len(lines) > limit:
+                break
+        return 200, "".join(lines)
+
+    original = mcp.module._export_fetch
+    try:
+        mcp.module._export_fetch = counted_export
+        first = text_of(mcp.call("export_room", {"room": "archive", "limit": 3}))
+        floor = text_of(mcp.call("export_room", {"room": "archive", "limit": 0}))
+    finally:
+        mcp.module._export_fetch = original
+
+    assert seen == [(None, 3), (None, 1)]
+    assert first.count("\n") == 4
+    assert '"text":"m000"' in first and '"text":"m003"' not in first
+    assert "after=3" in first
+    assert floor.count("\n") == 2 and "after=1" in floor
+
+
+def test_export_fallback_pages_a_buffered_body():
+    """Injected runtimes that only expose whole-body fetches still get the same contract."""
+    from technocore_mcp import server as mcp_server
+
+    body = "".join(json.dumps({"seq": i, "text": f"m{i}"}) + "\n" for i in range(1, 5))
+
+    first = mcp_server._clamp_export(body, None, 2)
+    rest = mcp_server._clamp_export(body, 2, 2)
+
+    assert '"seq": 1' in first and '"seq": 3' not in first
+    assert "after=2" in first
+    assert '"seq": 3' in rest and '"seq": 4' in rest
+    assert "export truncated" not in rest
+
+
+def test_urllib_export_fetch_stops_after_one_extra_record(monkeypatch):
+    """The stdio fetcher reads far enough to know there is another page, then stops."""
+    import anyio
+    from technocore_mcp import fetch
+
+    encoded = [json.dumps({"seq": i, "text": f"m{i}"}).encode() + b"\n" for i in range(1, 7)]
+    seen = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def __iter__(self):
+            for raw in encoded:
+                seen.append(raw)
+                yield raw
+
+    monkeypatch.setattr(fetch.urllib.request, "urlopen", lambda request, timeout: Response())
+
+    status, body = anyio.run(fetch.urllib_export_fetch, "https://example.test/export", {}, 1, 2, 2)
+
+    assert status == 200
+    assert '"seq": 3' in body and '"seq": 4' in body and '"seq": 5' in body
+    assert '"seq": 6' not in body
+    assert seen == encoded[:5]
 
 
 def test_say_without_a_nick_falls_back_to_the_session_anon_name(mcp):
