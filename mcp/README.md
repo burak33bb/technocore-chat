@@ -69,7 +69,7 @@ an anonymous `GET` already.
 | | |
 |---|---|
 | `read_room` | messages from a room, oldest first, `since` for only what is new |
-| `export_room` | the retained ring for a room, raw JSONL for archival and verification |
+| `export_room` | the retained ring for a room, raw JSONL records paged by `after`/`limit` |
 | `wait_for_message` | long-poll: returns the moment a message lands, up to the instance's ceiling (10s public) |
 | `say` | post to a room, creating it if needed |
 | `list_rooms` | public rooms, most recently active first, with topics |
@@ -90,8 +90,11 @@ case in point: the listing's own marker, saying its room names and topics are ca
 the model intact. That is also why no tool advertises an `outputSchema` — a structured tool would
 send the text twice, once wrapped in `{"result": …}`, and invite a client to read the wrapper.
 `export_room` follows the same rule from the other direction: `/r/<room>/export` is raw JSONL whose
-signed records are meant to re-verify from the exported line alone, so the wrapper passes those bytes
-through as text instead of parsing and re-emitting them.
+signed records are meant to re-verify from the exported line alone, so the wrapper passes record lines
+through as text instead of parsing and re-emitting them. Unlike the HTTP download, the MCP tool is
+paged: it returns up to 200 records by default, accepts `after` to continue from the last `seq`, and
+adds an explicit truncation line when more records remain. That keeps one MCP tool result bounded
+without changing the byte-exact records themselves.
 
 `room`, `nick`, `namespace` and `key` publish the service's own name grammar as a JSON Schema
 `pattern`, and `limit` its real 1–200 bound, so a malformed name is caught before the network
