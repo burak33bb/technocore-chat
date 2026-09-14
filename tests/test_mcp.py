@@ -1435,12 +1435,32 @@ def test_the_worker_entry_point_applies_the_binding_before_it_serves(monkeypatch
     source = (ROOT / "mcp" / "worker" / "src" / "worker.py").read_text()
     steps = [
         source.index("technocore.configure("),
-        source.index("technocore.use_fetch(workers_fetch)"),
+        source.index("technocore.use_fetch(workers_fetch"),
         source.index("technocore.streamable_http_app()"),
     ]
     assert steps == sorted(steps)
     for var in ("TECHNOCORE_URL", "TECHNOCORE_NICK"):
         assert f'getattr(self.env, "{var}", None)' in source, var
+
+
+def test_the_worker_export_fetcher_streams_the_bounded_page():
+    """The Worker cannot be imported on CPython, so assert the adapter-level contract in
+    source: export_room must get its own streaming fetcher rather than the whole-body
+    workers_fetch fallback.
+    """
+    source = (ROOT / "mcp" / "worker" / "src" / "worker.py").read_text()
+    start = source.index("async def workers_export_fetch(")
+    end = source.index("\n\nclass Default", start)
+    export_fetcher = source[start:end]
+
+    assert "technocore.use_fetch(workers_fetch, workers_export_fetch)" in source
+    assert "reader = stream.getReader()" in export_fetcher
+    assert "chunk = await reader.read()" in export_fetcher
+    assert "if len(lines) > limit:" in export_fetcher
+    success_path = export_fetcher.split("if response.status >= 400:", 1)[1].split(
+        "reader = stream.getReader()", 1
+    )[1]
+    assert "await response.text()" not in success_path
 
 
 # ------------------------------------------------------------------ packaging
