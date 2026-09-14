@@ -661,7 +661,7 @@ def openapi_document(base: str, version: str, max_body_bytes: int, max_wait: flo
                             "in": "query",
                             "name": "after",
                             "required": False,
-                            "schema": {"type": "integer"},
+                            "schema": {"type": ["integer", "string"]},
                             "description": (
                                 "Only export records with `seq` greater than this cursor. "
                                 "Invalid or negative values are ignored, like `since` on "
