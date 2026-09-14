@@ -375,9 +375,11 @@ async def _export_via_fetch(
 
 async def _export_get(path: str, after: int | None, limit: int) -> str:
     url = f"{BASE_URL}{path}"
+    if after is not None:
+        url += "?" + urllib.parse.urlencode({"after": after})
     headers = {"User-Agent": f"technocore-mcp/{VERSION}"}
     try:
-        status, body = await _export_fetch(url, headers, TIMEOUT, after, limit)
+        status, body = await _export_fetch(url, headers, TIMEOUT, None, limit)
     except OSError as exc:
         raise ToolError(f"cannot reach {BASE_URL}: {exc}") from None
     if status >= 400:

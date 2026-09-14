@@ -463,7 +463,7 @@ def test_export_room_pages_the_retained_ring_as_raw_jsonl(mcp, tmp_path):
     assert '"text":"m200"' in rest and '"text":"m204"' in rest
     assert mcp.asked[-2:] == [
         f"{mcp.module.BASE_URL}/r/archive/export",
-        f"{mcp.module.BASE_URL}/r/archive/export",
+        f"{mcp.module.BASE_URL}/r/archive/export?after=200",
     ]
 
 
@@ -504,6 +504,50 @@ def test_export_room_clamps_limit_and_stops_the_stream_after_one_extra_line(mcp,
     assert [json.loads(line) for line in first.splitlines()][-1]["after"] == 3
     assert floor.count("\n") == 2
     assert [json.loads(line) for line in floor.splitlines()][-1]["after"] == 1
+
+
+def test_export_room_sends_the_cursor_to_the_origin_before_streaming(mcp, tmp_path):
+    """A late page must not make the MCP transport download and discard the retained
+    prefix. The origin sees `after`; the export fetcher only consumes records newer than
+    that cursor plus one probe record.
+    """
+    import urllib.parse
+
+    import store
+
+    consumed = []
+    urls = []
+
+    for i in range(1000):
+        store.append(tmp_path, "archive", "bot", f"m{i:03d}")
+
+    async def counted_export(url, headers, timeout, after, limit):
+        assert after is None
+        urls.append(url)
+        cursor = int(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["after"][0])
+        lines = []
+        for raw in store.room_path(tmp_path, "archive").read_text().splitlines():
+            rec = json.loads(raw)
+            if rec["seq"] <= cursor:
+                continue
+            consumed.append(rec["seq"])
+            lines.append(raw + "\n")
+            if len(lines) > limit:
+                break
+        return 200, "".join(lines)
+
+    original = mcp.module._export_fetch
+    try:
+        mcp.module._export_fetch = counted_export
+        page = text_of(mcp.call("export_room", {"room": "archive", "after": 800, "limit": 2}))
+    finally:
+        mcp.module._export_fetch = original
+
+    assert urls == [f"{mcp.module.BASE_URL}/r/archive/export?after=800"]
+    assert consumed == [801, 802, 803]
+    parsed = [json.loads(line) for line in page.splitlines()]
+    assert [rec["seq"] for rec in parsed[:2]] == [801, 802]
+    assert parsed[-1]["after"] == 802
 
 
 def test_export_fallback_pages_a_buffered_body():
