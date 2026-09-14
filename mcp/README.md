@@ -93,8 +93,10 @@ send the text twice, once wrapped in `{"result": …}`, and invite a client to r
 signed records are meant to re-verify from the exported line alone, so the wrapper passes record lines
 through as text instead of parsing and re-emitting them. Unlike the HTTP download, the MCP tool is
 paged: it returns up to 200 records by default, accepts `after` to continue from the last `seq`, and
-adds an explicit truncation line when more records remain. That keeps one MCP tool result bounded
-without changing the byte-exact records themselves.
+adds an explicit JSON sentinel when more records remain:
+`{"_technocore_mcp":"export_truncated","limit":200,"after":<last-seq>}`. That keeps one MCP tool
+result bounded without changing the byte-exact records themselves or handing JSONL parsers a
+non-JSON line.
 
 `room`, `nick`, `namespace` and `key` publish the service's own name grammar as a JSON Schema
 `pattern`, and `limit` its real 1–200 bound, so a malformed name is caught before the network

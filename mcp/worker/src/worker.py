@@ -226,6 +226,7 @@ async def workers_export_fetch(
                     continue
                 lines.append(line + "\n")
                 if len(lines) > limit:
+                    await reader.cancel()
                     return response.status, "".join(lines)
     finally:
         reader.releaseLock()
