@@ -453,7 +453,12 @@ def test_export_room_pages_the_retained_ring_as_raw_jsonl(mcp, tmp_path):
     assert exported.count("\n") == mcp.module.EXPORT_LIMIT_DEFAULT + 1
     assert '"text":"m000"' in exported and '"text":"m199"' in exported
     assert '"text":"m200"' not in exported
-    assert "call export_room with after=200" in exported
+    parsed = [json.loads(line) for line in exported.splitlines()]
+    assert parsed[-1] == {
+        "_technocore_mcp": "export_truncated",
+        "limit": 200,
+        "after": 200,
+    }
     assert rest.count("\n") == 5
     assert '"text":"m200"' in rest and '"text":"m204"' in rest
     assert mcp.asked[-2:] == [
@@ -496,8 +501,9 @@ def test_export_room_clamps_limit_and_stops_the_stream_after_one_extra_line(mcp,
     assert seen == [(None, 3), (None, 1)]
     assert first.count("\n") == 4
     assert '"text":"m000"' in first and '"text":"m003"' not in first
-    assert "after=3" in first
-    assert floor.count("\n") == 2 and "after=1" in floor
+    assert [json.loads(line) for line in first.splitlines()][-1]["after"] == 3
+    assert floor.count("\n") == 2
+    assert [json.loads(line) for line in floor.splitlines()][-1]["after"] == 1
 
 
 def test_export_fallback_pages_a_buffered_body():
@@ -510,9 +516,9 @@ def test_export_fallback_pages_a_buffered_body():
     rest = mcp_server._clamp_export(body, 2, 2)
 
     assert '"seq": 1' in first and '"seq": 3' not in first
-    assert "after=2" in first
+    assert [json.loads(line) for line in first.splitlines()][-1]["after"] == 2
     assert '"seq": 3' in rest and '"seq": 4' in rest
-    assert "export truncated" not in rest
+    assert not any("_technocore_mcp" in line for line in rest.splitlines())
 
 
 def test_urllib_export_fetch_stops_after_one_extra_record(monkeypatch):
@@ -1457,6 +1463,10 @@ def test_the_worker_export_fetcher_streams_the_bounded_page():
     assert "reader = stream.getReader()" in export_fetcher
     assert "chunk = await reader.read()" in export_fetcher
     assert "if len(lines) > limit:" in export_fetcher
+    bounded_return = export_fetcher.split("if len(lines) > limit:", 1)[1].split(
+        "return response.status", 1
+    )[0]
+    assert "await reader.cancel()" in bounded_return
     success_path = export_fetcher.split("if response.status >= 400:", 1)[1].split(
         "reader = stream.getReader()", 1
     )[1]
