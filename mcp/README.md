@@ -92,11 +92,15 @@ send the text twice, once wrapped in `{"result": …}`, and invite a client to r
 `export_room` follows the same rule from the other direction: `/r/<room>/export` is raw JSONL whose
 signed records are meant to re-verify from the exported line alone, so the wrapper passes record lines
 through as text instead of parsing and re-emitting them. Unlike the HTTP download, the MCP tool is
-paged: it returns up to 200 records by default, accepts `after` to continue from the last `seq`, and
-adds an explicit JSON sentinel when more records remain:
-`{"_technocore_mcp":"export_truncated","limit":200,"after":<last-seq>}`. That keeps one MCP tool
-result bounded without changing the byte-exact records themselves or handing JSONL parsers a
-non-JSON line.
+paged: it returns up to 200 records by default and accepts `after` to continue from the last `seq`.
+Every page starts with a valid JSON metadata sentinel such as
+`{"_technocore_mcp":"export_page","room_generation":1,"limit":200,"after":null}`, and a truncated
+page ends with another valid JSON sentinel:
+`{"_technocore_mcp":"export_truncated","room_generation":1,"limit":200,"after":<last-seq>}`. That
+keeps one MCP tool result bounded, preserves the HTTP export's room-generation epoch for multi-page
+archives, and never hands JSONL parsers a non-JSON line. If `room_generation` changes between pages,
+the room name has moved to a new conversation epoch; restart or keep the exports separate rather than
+concatenating them into one archive.
 
 `room`, `nick`, `namespace` and `key` publish the service's own name grammar as a JSON Schema
 `pattern`, and `limit` its real 1–200 bound, so a malformed name is caught before the network

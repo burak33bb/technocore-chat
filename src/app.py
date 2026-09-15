@@ -1109,8 +1109,8 @@ def room_export(request: Request) -> Response:
     # One call carries both halves: the store reads the generation right after the open,
     # so header and body are captured back to back — up to the residual race
     # store.export_room's docstring accepts, never a request lifetime apart.
-    after = _cursor(request.query_params.get("after"), None)
-    generation, chunks = store.export_room(config.ROOT, room, after=after)
+    q = request.query_params
+    generation, chunks = store.export_room(config.ROOT, room, _cursor(q.get("after"), None))
     return StreamingResponse(
         chunks,
         media_type="application/x-ndjson; charset=utf-8",
@@ -1548,10 +1548,9 @@ def _condition(source: Mapping[str, object]) -> tuple[str | None, bool]:
     absent = flag if isinstance(flag, bool) else _ABSENT.get(_field(source, "if_absent").lower())
     if absent is None:
         raise StoreError(f"bad if_absent: expected one of {sorted(_ABSENT)}, not {flag!r}")
-    expect = _field(source, "if") if source.get("if") is not None else None
-    if absent and expect is not None:
+    if absent and source.get("if") is not None:
         raise StoreError("bad if_absent: refused with if= — send one condition, not both")
-    return expect, absent
+    return _field(source, "if") if source.get("if") is not None else None, absent
 
 
 def _note_write_gate(ns: str, key: str, value: str, signer: str | None) -> Response | None:

@@ -945,14 +945,31 @@ def _export_start(f, cutoff: float | None, end: int, after: int | None = None) -
     the tail read uses, unparsable `ts` failing closed with it. Costs one forward parse of
     the bytes being dropped, on the `e-` class only; every other room starts at 0 for free.
 
-    `after` applies the same prefix skip to an ordinary retained-ring export. The bytes
-    that remain are still the stored records as written; the cursor only chooses the
-    first byte to stream.
+    `after` applies the same prefix skip to an ordinary retained-ring export. Durable
+    rooms use a binary seek over monotonic seqs so a late cursor does not parse the
+    retained prefix on every page; ephemeral rooms still walk only while applying their
+    TTL prefix rule. The bytes that remain are still the stored records as written; the
+    cursor only chooses the first byte to stream.
     """
     if cutoff is None and after is None:
         return 0
-    f.seek(0)
     pos = 0
+    if cutoff is None and after is not None:
+        lo, hi, seq = 0, end, None
+        for _ in range(max(1, end.bit_length() + 1)):
+            mid = (lo + hi) // 2
+            f.seek(max(0, mid - 1))
+            if mid:
+                f.readline()
+            start, line = f.tell(), f.readline()
+            rec = _parse(line) if line else None
+            seq = rec.get("seq") if rec is not None else None
+            if not isinstance(seq, int):
+                break
+            lo, hi = (f.tell(), hi) if seq <= after else (lo, start)
+        if isinstance(seq, int):
+            pos = lo
+    f.seek(pos)
     while pos < end:
         line = f.readline()
         rec = _parse(line)
