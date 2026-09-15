@@ -35,7 +35,10 @@ import anyio.to_thread
 # body is the part the model needs. Raise `OSError` (and only `OSError`) when there was
 # no HTTP answer at all.
 Fetch = Callable[[str, str, dict[str, str], bytes | None, float], Awaitable[tuple[int, str]]]
-ExportFetch = Callable[[str, dict[str, str], float, int | None, int], Awaitable[tuple[int, str]]]
+ExportFetch = Callable[
+    [str, dict[str, str], float, int | None, int],
+    Awaitable[tuple[int, str, dict[str, str]]],
+]
 
 
 def _blocking_request(
@@ -83,7 +86,7 @@ def _seq(line: bytes) -> int | None:
 
 def _blocking_export_request(
     url: str, headers: dict[str, str], timeout: float, after: int | None, limit: int
-) -> tuple[int, str]:
+) -> tuple[int, str, dict[str, str]]:
     """Read at most one page of JSONL records from the export stream.
 
     The service's `/export` lane intentionally has no server-side pagination because it is
@@ -94,6 +97,7 @@ def _blocking_export_request(
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status = response.status
+            response_headers = dict(response.headers.items())
             lines: list[bytes] = []
             for raw in response:
                 seq = _seq(raw)
@@ -102,16 +106,16 @@ def _blocking_export_request(
                 lines.append(raw)
                 if len(lines) > limit:
                     break
-            return status, b"".join(lines).decode("utf-8", "replace")
+            return status, b"".join(lines).decode("utf-8", "replace"), response_headers
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode("utf-8", "replace")
+        return exc.code, exc.read().decode("utf-8", "replace"), dict(exc.headers.items())
     except urllib.error.URLError as exc:
         raise OSError(exc.reason) from None
 
 
 async def urllib_export_fetch(
     url: str, headers: dict[str, str], timeout: float, after: int | None, limit: int
-) -> tuple[int, str]:
+) -> tuple[int, str, dict[str, str]]:
     """The CPython export fetcher: stream lines and stop after the bounded page."""
     return await anyio.to_thread.run_sync(
         _blocking_export_request, url, headers, timeout, after, limit

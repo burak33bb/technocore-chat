@@ -185,7 +185,7 @@ def _export_seq(line: str) -> int | None:
 
 async def workers_export_fetch(
     url: str, headers: dict[str, str], timeout: float, after: int | None, limit: int
-) -> tuple[int, str]:
+) -> tuple[int, str, dict[str, str]]:
     """Stream one bounded export page through the Worker transport.
 
     `workers_fetch()` must keep returning whole response bodies for ordinary tool calls,
@@ -202,15 +202,19 @@ async def workers_export_fetch(
         raise
     except Exception as exc:
         raise OSError(str(exc)) from None
+    response_headers = {}
+    generation = response.headers.get("X-Room-Generation")
+    if generation is not None:
+        response_headers["X-Room-Generation"] = generation
     if response.status >= 400:
-        return response.status, await response.text()
+        return response.status, await response.text(), response_headers
 
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     buffer = ""
     lines: list[str] = []
     stream = getattr(response, "body", None)
     if stream is None:
-        return response.status, ""
+        return response.status, "", response_headers
 
     reader = stream.getReader()
     try:
@@ -227,7 +231,7 @@ async def workers_export_fetch(
                 lines.append(line + "\n")
                 if len(lines) > limit:
                     await reader.cancel()
-                    return response.status, "".join(lines)
+                    return response.status, "".join(lines), response_headers
     finally:
         reader.releaseLock()
 
@@ -238,7 +242,7 @@ async def workers_export_fetch(
         seq = _export_seq(buffer)
         if after is None or (seq is not None and seq > after):
             lines.append(buffer)
-    return response.status, "".join(lines)
+    return response.status, "".join(lines), response_headers
 
 
 class Default(WorkerEntrypoint):

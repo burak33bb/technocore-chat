@@ -148,7 +148,7 @@ def mcp(tmp_path, monkeypatch):
                         lines.append(raw + "\n")
                         if len(lines) > limit:
                             break
-                    return response.status_code, "".join(lines)
+                    return response.status_code, "".join(lines), dict(response.headers.items())
 
             monkeypatch.setattr(mcp_server, "_fetch", fetch)
             monkeypatch.setattr(mcp_server, "_export_fetch", export_fetch)
@@ -450,16 +450,23 @@ def test_export_room_pages_the_retained_ring_as_raw_jsonl(mcp, tmp_path):
 
     assert page.count("<~bot>") == 200
     assert "m000" not in page and "m204" in page
-    assert exported.count("\n") == mcp.module.EXPORT_LIMIT_DEFAULT + 1
+    assert exported.count("\n") == mcp.module.EXPORT_LIMIT_DEFAULT + 2
     assert '"text":"m000"' in exported and '"text":"m199"' in exported
     assert '"text":"m200"' not in exported
     parsed = [json.loads(line) for line in exported.splitlines()]
+    assert parsed[0] == {
+        "_technocore_mcp": "export_page",
+        "room_generation": 1,
+        "limit": 200,
+        "after": None,
+    }
     assert parsed[-1] == {
         "_technocore_mcp": "export_truncated",
+        "room_generation": 1,
         "limit": 200,
         "after": 200,
     }
-    assert rest.count("\n") == 5
+    assert rest.count("\n") == 6
     assert '"text":"m200"' in rest and '"text":"m204"' in rest
     assert mcp.asked[-2:] == [
         f"{mcp.module.BASE_URL}/r/archive/export",
@@ -488,7 +495,7 @@ def test_export_room_clamps_limit_and_stops_the_stream_after_one_extra_line(mcp,
             lines.append(raw + "\n")
             if len(lines) > limit:
                 break
-        return 200, "".join(lines)
+        return 200, "".join(lines), {"X-Room-Generation": "1"}
 
     original = mcp.module._export_fetch
     try:
@@ -499,10 +506,10 @@ def test_export_room_clamps_limit_and_stops_the_stream_after_one_extra_line(mcp,
         mcp.module._export_fetch = original
 
     assert seen == [(None, 3), (None, 1)]
-    assert first.count("\n") == 4
+    assert first.count("\n") == 5
     assert '"text":"m000"' in first and '"text":"m003"' not in first
     assert [json.loads(line) for line in first.splitlines()][-1]["after"] == 3
-    assert floor.count("\n") == 2
+    assert floor.count("\n") == 3
     assert [json.loads(line) for line in floor.splitlines()][-1]["after"] == 1
 
 
@@ -534,7 +541,7 @@ def test_export_room_sends_the_cursor_to_the_origin_before_streaming(mcp, tmp_pa
             lines.append(raw + "\n")
             if len(lines) > limit:
                 break
-        return 200, "".join(lines)
+        return 200, "".join(lines), {"X-Room-Generation": "1"}
 
     original = mcp.module._export_fetch
     try:
@@ -546,8 +553,58 @@ def test_export_room_sends_the_cursor_to_the_origin_before_streaming(mcp, tmp_pa
     assert urls == [f"{mcp.module.BASE_URL}/r/archive/export?after=800"]
     assert consumed == [801, 802, 803]
     parsed = [json.loads(line) for line in page.splitlines()]
-    assert [rec["seq"] for rec in parsed[:2]] == [801, 802]
+    assert parsed[0]["room_generation"] == 1
+    assert parsed[0]["after"] == 800
+    assert [rec["seq"] for rec in parsed[1:3]] == [801, 802]
     assert parsed[-1]["after"] == 802
+
+
+def test_export_room_exposes_generation_changes_between_pages(mcp, tmp_path):
+    """MCP paged exports must carry the room epoch the HTTP lane exposes in its header."""
+    import urllib.parse
+
+    import _client
+
+    import store
+
+    for i in range(3):
+        store.append(tmp_path, "epoch", "bot", f"old {i}")
+
+    async def exported_from_store(url, headers, timeout, after, limit):
+        assert after is None
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        cursor = int(query["after"][0]) if "after" in query else None
+        generation, chunks = store.export_room(tmp_path, "epoch", after=cursor)
+        return 200, b"".join(chunks).decode(), {"X-Room-Generation": str(generation)}
+
+    original = mcp.module._export_fetch
+    mcp.module._export_fetch = exported_from_store
+
+    try:
+        first = [
+            json.loads(line)
+            for line in text_of(mcp.call("export_room", {"room": "epoch", "limit": 2})).splitlines()
+        ]
+        assert first[0]["room_generation"] == 1
+        assert first[-1]["after"] == 2
+
+        _client._age(store.room_path(tmp_path, "epoch"), store.IDLE_SECONDS + 60)
+        (tmp_path / ".reaped").unlink(missing_ok=True)
+        store._reap(tmp_path)
+        store.append(tmp_path, "epoch", "bot", "new epoch")
+
+        continued = [
+            json.loads(line)
+            for line in text_of(
+                mcp.call("export_room", {"room": "epoch", "after": first[-1]["after"], "limit": 2})
+            ).splitlines()
+        ]
+    finally:
+        mcp.module._export_fetch = original
+
+    assert continued[0]["room_generation"] == 2
+    assert continued[0]["after"] == 2
+    assert any(record.get("text") == "new epoch" for record in continued[1:])
 
 
 def test_export_fallback_pages_a_buffered_body():
@@ -559,8 +616,8 @@ def test_export_fallback_pages_a_buffered_body():
     first = mcp_server._clamp_export(body, None, 2)
     rest = mcp_server._clamp_export(body, 2, 2)
 
-    assert '"seq": 1' in first and '"seq": 3' not in first
-    assert [json.loads(line) for line in first.splitlines()][-1]["after"] == 2
+    assert '"seq": 1' in first and '"seq": 3' in first
+    assert first.count("\n") == 3
     assert '"seq": 3' in rest and '"seq": 4' in rest
     assert not any("_technocore_mcp" in line for line in rest.splitlines())
 
@@ -575,6 +632,7 @@ def test_urllib_export_fetch_stops_after_one_extra_record(monkeypatch):
 
     class Response:
         status = 200
+        headers = {}
 
         def __enter__(self):
             return self
@@ -589,9 +647,12 @@ def test_urllib_export_fetch_stops_after_one_extra_record(monkeypatch):
 
     monkeypatch.setattr(fetch.urllib.request, "urlopen", lambda request, timeout: Response())
 
-    status, body = anyio.run(fetch.urllib_export_fetch, "https://example.test/export", {}, 1, 2, 2)
+    status, body, headers = anyio.run(
+        fetch.urllib_export_fetch, "https://example.test/export", {}, 1, 2, 2
+    )
 
     assert status == 200
+    assert headers == {}
     assert '"seq": 3' in body and '"seq": 4' in body and '"seq": 5' in body
     assert '"seq": 6' not in body
     assert seen == encoded[:5]
