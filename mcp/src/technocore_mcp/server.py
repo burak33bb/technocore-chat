@@ -319,10 +319,40 @@ def _clamped_limit(limit: int | None, default: int, ceiling: int) -> int:
     return min(n or 1, ceiling)
 
 
-def _export_page_marker(lines: list[str], limit: int, truncated: bool) -> str:
-    body = "\n".join(lines)
-    if body:
-        body += "\n"
+def _header(headers: dict[str, str], name: str) -> str | None:
+    folded = name.lower()
+    for key, value in headers.items():
+        if key.lower() == folded:
+            return value
+    return None
+
+
+def _room_generation(headers: dict[str, str]) -> int | None:
+    value = _header(headers, "X-Room-Generation")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _export_page_marker(
+    lines: list[str],
+    limit: int,
+    truncated: bool,
+    generation: int | None = None,
+    requested_after: int | None = None,
+) -> str:
+    page = {
+        "_technocore_mcp": "export_page",
+        "room_generation": generation,
+        "limit": limit,
+        "after": requested_after,
+    }
+    body = json.dumps(page, separators=(",", ":")) + "\n"
+    if lines:
+        body += "\n".join(lines) + "\n"
     if not truncated:
         return body
     last = None
@@ -336,6 +366,7 @@ def _export_page_marker(lines: list[str], limit: int, truncated: bool) -> str:
             break
     marker = {
         "_technocore_mcp": "export_truncated",
+        "room_generation": generation,
         "limit": limit,
         "after": last,
     }
@@ -361,16 +392,16 @@ def _clamp_export(body: str, after: int | None, limit: int) -> str:
         kept.append(line)
         if len(kept) > limit:
             break
-    return _export_page_marker(kept[:limit], limit, len(kept) > limit)
+    return "\n".join(kept) + ("\n" if kept else "")
 
 
 async def _export_via_fetch(
     url: str, headers: dict[str, str], timeout: float, after: int | None, limit: int
-) -> tuple[int, str]:
+) -> tuple[int, str, dict[str, str]]:
     status, body = await _fetch("GET", url, headers, None, timeout)
     if status >= 400:
-        return status, body
-    return status, _clamp_export(body, after, limit)
+        return status, body, {}
+    return status, _clamp_export(body, after, limit), {}
 
 
 async def _export_get(path: str, after: int | None, limit: int) -> str:
@@ -379,14 +410,16 @@ async def _export_get(path: str, after: int | None, limit: int) -> str:
         url += "?" + urllib.parse.urlencode({"after": after})
     headers = {"User-Agent": f"technocore-mcp/{VERSION}"}
     try:
-        status, body = await _export_fetch(url, headers, TIMEOUT, None, limit)
+        status, body, response_headers = await _export_fetch(url, headers, TIMEOUT, None, limit)
     except OSError as exc:
         raise ToolError(f"cannot reach {BASE_URL}: {exc}") from None
     if status >= 400:
         raise ToolError(body.strip() or f"HTTP {status}")
     lines = body.splitlines()
     truncated = len(lines) > limit
-    return _export_page_marker(lines[:limit], limit, truncated)
+    return _export_page_marker(
+        lines[:limit], limit, truncated, _room_generation(response_headers), after
+    )
 
 
 def _segment(value: str) -> str:

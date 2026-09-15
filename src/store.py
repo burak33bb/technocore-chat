@@ -29,6 +29,7 @@ import orjson
 
 import config
 import didkey
+import export_seek
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 
@@ -945,12 +946,18 @@ def _export_start(f, cutoff: float | None, end: int, after: int | None = None) -
     the tail read uses, unparsable `ts` failing closed with it. Costs one forward parse of
     the bytes being dropped, on the `e-` class only; every other room starts at 0 for free.
 
-    `after` applies the same prefix skip to an ordinary retained-ring export. The bytes
-    that remain are still the stored records as written; the cursor only chooses the
-    first byte to stream.
+    `after` applies the same prefix skip to an ordinary retained-ring export. Durable
+    rooms use a binary seek over monotonic seqs so a late cursor does not parse the
+    retained prefix on every page; ephemeral rooms still walk only while applying their
+    TTL prefix rule. The bytes that remain are still the stored records as written; the
+    cursor only chooses the first byte to stream.
     """
     if cutoff is None and after is None:
         return 0
+    if cutoff is None and after is not None:
+        start = export_seek.after_start(f, end, after, _parse)
+        if start is not None:
+            return start
     f.seek(0)
     pos = 0
     while pos < end:
