@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from bisect import bisect_left
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
@@ -954,8 +955,7 @@ def _snapshot_bytes(f) -> int:
     anything past it is a write still in flight, which must cost only itself."""
     pos = os.fstat(f.fileno()).st_size
     while pos > 0:
-        step = min(EXPORT_CHUNK, pos)
-        f.seek(pos - step)
+        f.seek(pos - (step := min(EXPORT_CHUNK, pos)))
         if (nl := f.read(step).rfind(b"\n")) != -1:
             return pos - step + nl + 1
         pos -= step
@@ -963,49 +963,29 @@ def _snapshot_bytes(f) -> int:
 
 
 def _export_start(f, cutoff: float | None, end: int, after: int | None = None) -> int:
-    """Where the export begins: 0, or just past an `e-` room's expired prefix.
-
-    Ephemeral expiry is drop-on-read and a raw dump is a read: streaming records the class
-    promises have stopped being readable would make export the one lane that ignores the
-    TTL. Records are append-ordered, so the expired records are a prefix, and the export
-    starts at the first line whose record is still readable — judged by the same `_expired`
-    the tail read uses, unparsable `ts` failing closed with it. Costs one forward parse of
-    the bytes being dropped, on the `e-` class only; every other room starts at 0 for free.
-
-    `after` applies the same prefix skip to an ordinary retained-ring export. Durable
-    rooms use a binary seek over monotonic seqs so a late cursor does not parse the
-    retained prefix on every page; ephemeral rooms still walk only while applying their
-    TTL prefix rule. The bytes that remain are still the stored records as written; the
-    cursor only chooses the first byte to stream.
+    """Where export starts after its unreadable prefix. Ephemeral expiry is drop-on-read,
+    so those rooms walk past expired records using the tail reader's fail-closed rule.
+    Durable rooms binary-seek monotonic seqs for `after`, keeping late pages cheap. Either
+    way the cursor chooses the first byte; exported record bytes remain untouched.
     """
     if cutoff is None and after is None:
         return 0
     pos = 0
-    if cutoff is None and after is not None:
-        lo, hi, seq = 0, end, None
-        for _ in range(max(1, end.bit_length() + 1)):
-            mid = (lo + hi) // 2
-            f.seek(max(0, mid - 1))
-            if mid:
+    if cutoff is None:
+
+        def seq_at(pos: int) -> int:
+            f.seek(max(0, pos - 1))
+            if pos:
                 f.readline()
-            start, line = f.tell(), f.readline()
-            rec = _parse(line) if line else None
-            seq = rec.get("seq") if rec is not None else None
-            if not isinstance(seq, int):
-                break
-            lo, hi = (f.tell(), hi) if seq <= after else (lo, start)
-        if isinstance(seq, int):
-            pos = lo
+            return rec["seq"] if (rec := _parse(f.readline())) is not None else (after or 0) + 1
+
+        pos = bisect_left(range(end), (after or 0) + 1, key=seq_at)
     f.seek(pos)
-    while pos < end:
-        line = f.readline()
-        rec = _parse(line)
-        seq = rec.get("seq") if rec is not None else None
-        expired = cutoff is not None and (rec is None or _expired(rec, cutoff))
-        before_cursor = after is not None and (not isinstance(seq, int) or seq <= after)
-        if not expired and not before_cursor:
-            return pos
-        pos += len(line)
+    while (pos := f.tell()) < end:
+        rec = _parse(f.readline())
+        if rec is not None and rec["seq"] > (after or 0):
+            if cutoff is None or not _expired(rec, cutoff):
+                return pos
     return end
 
 
@@ -1013,33 +993,19 @@ def export_room(root: Path, room: str, after: int | None = None) -> tuple[int, I
     """The room's stored JSONL, bytes as written, snapshotted at open — and the room
     generation that snapshot belongs to.
 
-    Byte-exact because verifiability demands it: a signed record re-verifies only against
-    the stored `text` bytes exactly as `clean_text` wrote them, so re-serializing — even a
-    round trip through the same encoder — is a way to corrupt proofs, not a formatting
-    choice. The bound is one fstat when the file is opened, truncated to the last complete
-    line (`_snapshot_bytes`), so an append landing mid-export is simply outside the
-    snapshot rather than a torn record inside it. An `e-` room's expired prefix, and any
-    records at or below `after`, are outside it too (`_export_start`): expiry is
-    drop-on-read, and export is a read.
+    Signed records require the exact stored bytes; re-serializing can corrupt their proofs.
+    One fstat bounds the snapshot at its last complete line, so concurrent appends stay
+    outside it. `_export_start` also excludes expired and pre-cursor records.
 
-    Opened HERE, not when the first chunk is pulled, because two things must be settled
-    while an error can still become a status code: a room that exists but cannot be read
-    raises rather than impersonating the documented empty answer — only FileNotFoundError
-    IS that answer — and the generation is read immediately after the open, from the seq
-    state (the fd itself carries no epoch), so the two are captured back to back instead
-    of a request lifetime apart. The gap between the open and that read is the residual
-    race, accepted: closing it needs the seqstate and room locks held together, on a path
-    that deliberately holds neither.
+    Open HERE, not on the first chunk: unreadable rooms must fail before a 200 starts, and
+    generation must be captured beside the file snapshot. Their small residual race is
+    accepted because closing it would require taking both locks on this lock-free path.
 
-    No lock, held or taken. An append past the snapshot is invisible by the bound above,
-    and compaction replaces the file atomically (`_replace`), so the fd opened here keeps
-    reading the inode it opened — a consistent old ring, never a half-rewritten new one.
-    Holding the flock across a client-paced stream would let one slow reader stall every
-    writer instead.
+    No lock is held: the bound hides appends and atomic compaction leaves this fd on its
+    consistent old inode. A lock across a client-paced stream would stall every writer.
 
-    An absent room exports as zero bytes, the same nothing `read_messages` reads there:
-    export creates no room and never runs the reaper. The name is validated before the
-    iterator is handed out, so a bad name refuses up front instead of mid-stream.
+    Missing rooms export empty without creating or reaping; bad names fail before the
+    iterator is returned.
     """
     path = room_path(root, room)
     try:
@@ -1057,13 +1023,7 @@ def export_room(root: Path, room: str, after: int | None = None) -> tuple[int, I
     def chunks() -> Iterator[bytes]:
         with f:
             f.seek(start)
-            remaining = end - start
-            while remaining > 0:
-                block = f.read(min(EXPORT_CHUNK, remaining))
-                if not block:
-                    return  # unreachable on a held inode; never spin on a short read
-                remaining -= len(block)
-                yield block
+            yield from iter(lambda: f.read(min(EXPORT_CHUNK, end - f.tell())), b"")
 
     return generation, chunks()
 
