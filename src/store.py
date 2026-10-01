@@ -965,13 +965,13 @@ def _snapshot_bytes(f) -> int:
 def _export_start(f, cutoff: float | None, end: int, after: int | None = None) -> int:
     """Where export starts after its unreadable prefix. Ephemeral expiry is drop-on-read,
     so those rooms walk past expired records using the tail reader's fail-closed rule.
-    Durable rooms binary-seek monotonic seqs for `after`, keeping late pages cheap. Either
+    All rooms binary-seek monotonic seqs for `after`, keeping late pages cheap. Either
     way the cursor chooses the first byte; exported record bytes remain untouched.
     """
     if cutoff is None and after is None:
         return 0
     pos = 0
-    if cutoff is None:
+    if after is not None:
 
         def seq_at(pos: int) -> int:
             f.seek(max(0, pos - 1))

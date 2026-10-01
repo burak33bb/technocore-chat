@@ -120,10 +120,11 @@ def test_the_generation_is_captured_beside_the_snapshot(tmp_path):
     b"".join(chunks)
 
 
-def test_a_late_after_cursor_seeks_without_parsing_the_retained_prefix(tmp_path, monkeypatch):
+@pytest.mark.parametrize("room", ["archive", "e-archive"])
+def test_a_late_after_cursor_seeks_without_parsing_the_retained_prefix(tmp_path, monkeypatch, room):
     """A late export page must not rescan every retained record before the cursor."""
     for i in range(1000):
-        store.append(tmp_path, "archive", "bot", f"line {i}")
+        store.append(tmp_path, room, "bot", f"line {i}")
 
     parse_count = 0
     real_parse = store._parse
@@ -135,12 +136,27 @@ def test_a_late_after_cursor_seeks_without_parsing_the_retained_prefix(tmp_path,
 
     monkeypatch.setattr(store, "_parse", counted_parse)
 
-    _, chunks = store.export_room(tmp_path, "archive", after=800)
+    _, chunks = store.export_room(tmp_path, room, after=800)
     first = next(chunks)
 
     assert b'"seq":801' in first
     assert b'"seq":800' not in first
     assert parse_count < 30
+
+
+@pytest.mark.parametrize("after", [1, 2, 3, 4])
+def test_ephemeral_cursor_still_excludes_expired_records(tmp_path, monkeypatch, after):
+    from datetime import UTC, datetime, timedelta
+
+    stale = datetime.now(UTC) - timedelta(seconds=store.EPHEMERAL_TTL_SECONDS + 60)
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_now", lambda: stale.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+        _fill(tmp_path, "e-cursor", n=3)
+    store.append(tmp_path, "e-cursor", "bot", "live")
+    last_line = store.room_path(tmp_path, "e-cursor").read_bytes().splitlines(keepends=True)[-1]
+
+    _, chunks = store.export_room(tmp_path, "e-cursor", after=after)
+    assert b"".join(chunks) == (last_line if after < 4 else b"")
 
 
 def test_a_bad_name_refuses_before_the_stream_starts(tmp_path):
