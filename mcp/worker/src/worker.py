@@ -45,6 +45,8 @@ import hmac
 import json
 from typing import Any
 
+from js import AbortSignal  # ty: ignore[unresolved-import]
+
 # `workers` is the runtime SDK Cloudflare injects; it exists only inside a Python Worker
 # and is not installable on CPython, so nothing outside that runtime can resolve it.
 from workers import Response, WorkerEntrypoint, asgi, fetch  # ty: ignore[unresolved-import]
@@ -193,56 +195,58 @@ async def workers_export_fetch(
     the stdio export fetcher: read JSONL chunks from the platform stream, keep at most the
     requested page plus one continuation probe record, then stop consuming the origin body.
 
-    `timeout` is accepted for the shared `ExportFetch` signature; Cloudflare bounds the
-    subrequest lifetime.
+    The deadline covers both headers and body consumption. The platform signal aborts
+    the underlying request even when the origin stops producing export records.
     """
     try:
-        response = await fetch(url, method="GET", headers=headers)
+        signal = AbortSignal.timeout(int(timeout * 1000))
+        response = await fetch(url, method="GET", headers=headers, signal=signal)
+        response_headers = {}
+        generation = response.headers.get("X-Room-Generation")
+        if generation is not None:
+            response_headers["X-Room-Generation"] = generation
+        if response.status >= 400:
+            return response.status, await response.text(), response_headers
+
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        buffer = ""
+        lines: list[str] = []
+        stream = getattr(response, "body", None)
+        if stream is None:
+            return response.status, "", response_headers
+
+        reader = stream.getReader()
+        try:
+            while True:
+                chunk = await reader.read()
+                if chunk.done:
+                    break
+                buffer += decoder.decode(_chunk_bytes(chunk.value))
+                while "\n" in buffer:
+                    line, _, buffer = buffer.partition("\n")
+                    seq = _export_seq(line)
+                    if after is not None and (seq is None or seq <= after):
+                        continue
+                    lines.append(line + "\n")
+                    if len(lines) > limit:
+                        await reader.cancel()
+                        return response.status, "".join(lines), response_headers
+        finally:
+            reader.releaseLock()
+
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            buffer += tail
+        if buffer:
+            seq = _export_seq(buffer)
+            if after is None or (seq is not None and seq > after):
+                lines.append(buffer)
+        return response.status, "".join(lines), response_headers
     except OSError:
         raise
     except Exception as exc:
+        # An aborted/incomplete body is a transport failure, never a partial export page.
         raise OSError(str(exc)) from None
-    response_headers = {}
-    generation = response.headers.get("X-Room-Generation")
-    if generation is not None:
-        response_headers["X-Room-Generation"] = generation
-    if response.status >= 400:
-        return response.status, await response.text(), response_headers
-
-    decoder = codecs.getincrementaldecoder("utf-8")("replace")
-    buffer = ""
-    lines: list[str] = []
-    stream = getattr(response, "body", None)
-    if stream is None:
-        return response.status, "", response_headers
-
-    reader = stream.getReader()
-    try:
-        while True:
-            chunk = await reader.read()
-            if chunk.done:
-                break
-            buffer += decoder.decode(_chunk_bytes(chunk.value))
-            while "\n" in buffer:
-                line, _, buffer = buffer.partition("\n")
-                seq = _export_seq(line)
-                if after is not None and (seq is None or seq <= after):
-                    continue
-                lines.append(line + "\n")
-                if len(lines) > limit:
-                    await reader.cancel()
-                    return response.status, "".join(lines), response_headers
-    finally:
-        reader.releaseLock()
-
-    tail = decoder.decode(b"", final=True)
-    if tail:
-        buffer += tail
-    if buffer:
-        seq = _export_seq(buffer)
-        if after is None or (seq is not None and seq > after):
-            lines.append(buffer)
-    return response.status, "".join(lines), response_headers
 
 
 class Default(WorkerEntrypoint):
